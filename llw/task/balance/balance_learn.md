@@ -74,6 +74,8 @@
 ### 使用PID控制
 **问题**：为了使小车实现平衡和其他的运动需求，我们需要控制哪些*状态*？
 
+**我的理解**：需要控制小车 pitch 
+
 参考文章：[平衡小车控制原理（受力分析及公式推导）](https://www.bilibili.com/read/cv7875274/?opus_fallback=1)
 
 根据本文章我建立了对平衡小车控制的基本认知：**平衡就是控制 pitch 不变**
@@ -105,8 +107,22 @@ graph LR
     VelLoop -->|目标 Pitch| BalLoop[平衡环 PID]
     BalLoop -->|力矩指令| Motor[电机驱动]
     
-    Motor --> Car{小车实体}
+    Motor --> Car{平衡小车}
     Car -.->|IMU 姿态反馈| BalLoop
     Car -.->|编码器速度反馈| VelLoop
     Car -.->|里程反馈| PosLoop
+```
+
+**遇到的问题**：即使添加了位置环，小车仍然无法稳定在一个位置，会缓慢来回移动。
+**我的解决方法**：首先我尝试调节PID参数，尝试了将error发话题用plotjuggler看曲线的调试思路，但效果不明显。后面根据参考文章修改了控制公式，添加了*控制阻尼力*：
+![](../pic/artical_01.png)
+
+代码实现为：
+```cpp
+  //....
+  current_pitch_ = pitch;
+  current_pitch_dot_ = msg->angular_velocity.y; // 获取 IMU 提供的角速度作为微分项
+  //....
+  double pitch_error = current_pitch_ - target_pitch_;
+  double base_effort = balance_pid_.computeCommand(pitch_error, current_pitch_dot_, period);
 ```
