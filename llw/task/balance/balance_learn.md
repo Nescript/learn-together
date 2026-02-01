@@ -5,8 +5,8 @@
 | 平衡小车URDF     |  已完成  | 在之前差速小车URDF基础上修改得来，调整了质量和对应的惯性矩阵 |
 | 平衡小车关节驱动 |   已完成   | 通过给两边轮子加载力矩控制器实现 |
 | 为平衡小车添加IMU  |  已完成  | 通过Gazebo传感器插件添加了 IMU |
-| 搭建平衡小车控制器 | 部分完成 | 实现了使用PID控制 |
-| ...              | ...      | ...  |
+| 搭建平衡小车控制器 | 已完成 | 实现了使用PID和LQR控制 |
+| 添加云台 | 已完成 | 实现了跟随模式 |
 
 ## 功能细节
 
@@ -127,3 +127,83 @@ graph LR
   double pitch_error = current_pitch_ - target_pitch_;
   double base_effort = balance_pid_.computeCommand(pitch_error, current_pitch_dot_, period);
 ```
+
+该方法让我产生如下思考：
+- D 项是微分项，考虑物理量的关系，位置环的微分项是速度，速度环的微分项是加速度，平衡环的微分项是角速度。假设我在调一个控制角度的pid，那么相比起微分得到的d项，从**编码器**中读取角速度作为d项会更觉准确，避免微分产生的误差。
+- I 项目是积分项，考虑物理量的关系，速度的积分是位置。假设我在调一个控制速度的pid，那么比起用 i 项来消除稳态误差，从车体别的接口中获取**位置相关信息**，外套一个位置环效果会更好（？）。
+
+#### 使用LQR控制
+
+##### 如何使用LQR
+
+最直接地，我们需要建立小车的状态空间模型，包含一个状态矩阵 A 一个输入矩阵 B。接着通过选择合适的权重矩阵 Q 和 R，即可使用现成的轮子计算增益矩阵k
+```python
+control.lqr(A, B, Q, R)
+```
+增益矩阵k的四个元素分别对应模型中的四个状态变量。我们将之与对应的当前状态变量相乘并取负号，即可得到控制输入 u
+```cpp
+base_effort = -(k1_selfup * pos_error + k2_selfup * vel_error + k3_selfup * pitch_error + k4_selfup * omega_error);
+```
+
+##### 状态空间模型建立
+
+![alt text](../pic/lqr_00.jpg)
+
+**遇到的问题**：极性
+**我的解决方法**：一定要注意状态变量的定义，尤其是角度的正负方向！。而error的计算也要注意，lqr常用的是*当前状态减去目标状态*。
+
+##### LQR 调参
+LQR 调参的核心在于 Q 和 R 矩阵的选择。Q 矩阵中对角线元素越大，表示对应状态变量的重要性越高，系统会更倾向于减小该状态变量的误差。R 矩阵中对角线元素越大，表示对控制输入的惩罚越大，系统会更倾向于减少控制输入的使用。
+实践上，当我们发现系统输出的力矩指令过大，超过了电机限制，可以考虑调小R矩阵的值。Q矩阵对角线元素的选取则依赖于具体的控制目标。
+
+LQR的另一种调参思路是利用克雷森法则：[LQR控制器的参数整定技巧](https://github.com/WilliamGwok/RP_Balance/blob/main/%E5%AE%9E%E8%BD%A6%E8%B0%83%E8%AF%95%E7%BB%86%E8%8A%82/%E5%85%B3%E4%BA%8ELQR%E6%8E%A7%E5%88%B6%E5%99%A8%E7%9A%84%E5%8F%82%E6%95%B0%E6%95%B4%E5%AE%9A%E6%8A%80%E5%B7%A7.md)
+简单的讲，克雷森法则就是
+- 将Q矩阵的各元素设定为该项可接受的最大误差的倒数平方。
+- 将R矩阵的各元素设定为该项可接受的最大控制输入的倒数平方。
+
+我在实践中运用此法则得到了不错的效果，使用的时候要注意各项目的单位都和推导过程中一样，即国际单位制。
+
+**遇到的问题**：通过调整矩阵得到了不错的刹车效果，但无法倒地自起
+**原因**：我认为是调大位置权重，导致系统过于关注位置误差，无法给予起身足够的位置误差。
+**我的解决方法**：我开始尝试使用两套k，其中一套用于平衡和前后移动，另一套用于自起。通过构建一个倒地状态机来切换使用的k矩阵。
+```cpp
+  switch (current_state_) {
+    case STATE_NORMAL:
+        if (std::abs(pitch_error) > 0.835) {
+            current_state_ = STATE_FALLEN;
+            ROS_INFO("Switched to FALLEN state");
+        }
+        break;
+
+    case STATE_FALLEN:
+        if (std::abs(omega_error) < 0.2 && std::abs(vel_error) < 0.01) {
+            current_state_ = STATE_SELF_UP;
+            self_up_start_time_ = time;
+            last_effort_ = 0.0;
+            ROS_INFO("Switched to SELF_UP state");
+        }
+        break;
+
+    case STATE_SELF_UP:
+        if ((time - self_up_start_time_).toSec() > 6.0) {
+            current_state_ = STATE_NORMAL;
+            ROS_INFO("Switched to NORMAL state");
+        }
+        break;
+  }
+```
+
+在给当前的小车加上一个pid控制yaw转向后，没有云台的平衡小车控制器部分就基本完成，控制效果良好，实现了所有运动需求。
+
+### 添加云台
+
+这次我添加了一个有yaw和pitch两个轴的云台
+![alt text](../pic/balance_car_with_gimbal.png)
+
+云台的yaw控制思路和先前差速小车的相同：云台的yaw轴pid跟随角速度指令，底盘的yaw轴pid跟随云台的yaw角度指令。
+
+**遇到的问题**：添加云台后，小车的重心上移且会随云台移动而变化
+**我的解决方法**：LQR算法具有一定的鲁棒性，通过调整Q和R矩阵的权重，能够适应云台带来的重心变化，保持小车的平衡控制效果。
+
+**遇到的问题**：添加云台后，小车的平衡时pitch不为0而会有一个偏移
+**我的解决方法**：通过计算这个偏移作为小车的目标pitch，从而补偿这个偏移，防止小车为控制pitch为0而飘车。
